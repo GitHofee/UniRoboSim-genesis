@@ -1,0 +1,245 @@
+"""Lossless USD composition in adapter-owned files; source assets stay untouched."""
+from pathlib import Path
+import hashlib
+import json
+import os
+from urllib.parse import unquote, urlparse
+import numpy as np
+from unirobosim import EntityKind, Pose, ValidationError
+from .math import compose, inverse
+
+
+def _normalize_joints(stage, scale):
+    from pxr import Gf, UsdGeom, UsdPhysics
+    cache=UsdGeom.XformCache();unit=UsdGeom.GetStageMetersPerUnit(stage)
+    closures=[];world_anchors=[]
+    for prim in stage.Traverse():
+        if not prim.IsA(UsdPhysics.Joint):
+            continue
+        joint=UsdPhysics.Joint(prim)
+        if joint.GetJointEnabledAttr().Get() is False:
+            prim.SetTypeName("");continue
+        excluded=bool(prim.GetAttribute("physics:excludeFromArticulation").Get())
+        if excluded:
+            if not prim.IsA(UsdPhysics.SphericalJoint):
+                raise ValidationError("excluded USD joint type is unsupported",operation="genesis.usd.joints")
+            bodies=[];anchors=[]
+            for side in (0,1):
+                target=getattr(joint,f"GetBody{side}Rel")().GetTargets()
+                if len(target)!=1:
+                    raise ValidationError("closure requires two physical bodies",operation="genesis.usd.joints")
+                body=stage.GetPrimAtPath(target[0])
+                if not body.HasAPI(UsdPhysics.RigidBodyAPI):
+                    raise ValidationError("closure target is not an authored rigid body",operation="genesis.usd.joints")
+                matrix=np.asarray(cache.GetLocalToWorldTransform(body)).T
+                u,_,vt=np.linalg.svd(matrix[:3,:3]);r=u@vt
+                if np.linalg.det(r)<0:r[:,0]*=-1
+                point=np.asarray(getattr(joint,f"GetLocalPos{side}Attr")().Get(),dtype=float)
+                local=(r.T@matrix[:3,:3]@point)*unit*scale
+                bodies.append(str(body.GetPath()));anchors.append(local.tolist())
+            closures.append({"name":prim.GetName(),"bodies":bodies,"anchors_m":anchors})
+            prim.SetTypeName("")
+            continue
+        for side in (0,1):
+            relationship=getattr(joint,f"GetBody{side}Rel")();targets=relationship.GetTargets()
+            if not targets:continue
+            target=stage.GetPrimAtPath(targets[0])
+            if target.HasAPI(UsdPhysics.RigidBodyAPI):continue
+            ancestor=target.GetParent()
+            while ancestor and not ancestor.HasAPI(UsdPhysics.RigidBodyAPI):ancestor=ancestor.GetParent()
+            if ancestor:
+                raise ValidationError("joint references a non-body descendant frame",operation="genesis.usd.joints")
+            # A non-rigid target is an immobile world frame, never its rigid descendant.
+            matrix=cache.GetLocalToWorldTransform(target)
+            pos_attr=getattr(joint,f"GetLocalPos{side}Attr")()
+            point=matrix.Transform(Gf.Vec3d(pos_attr.Get() or (0.,0.,0.)))
+            rot_attr=getattr(joint,f"GetLocalRot{side}Attr")()
+            local=rot_attr.Get() or Gf.Quatf(1.)
+            q=Gf.Transform(matrix).GetRotation().GetQuat()*Gf.Quatd(local)
+            relationship.ClearTargets(True);pos_attr.Set(Gf.Vec3f(point));rot_attr.Set(Gf.Quatf(q))
+            world_anchors.append({"joint":str(prim.GetPath()),"side":side,"original_target":str(target.GetPath())})
+    return closures,world_anchors
+
+
+def _pose(matrix):
+    from pxr import Gf
+    tf = Gf.Transform(matrix)
+    q = tf.GetRotation().GetQuat()
+    return Pose(tuple(float(v) for v in tf.GetTranslation()),
+        tuple(float(v) for v in q.GetImaginary())+(float(q.GetReal()),))
+
+
+def _collision_signature(stage, source_paths=None):
+    """Identity of collider geometry and authored world transforms before import."""
+    from pxr import UsdGeom, UsdPhysics
+    cache=UsdGeom.XformCache()
+    entries=[]
+    geometry_attributes={"points","faceVertexCounts","faceVertexIndices","orientation",
+        "subdivisionScheme","holeIndices","size","radius","height","axis","extent",
+        "physics:collisionEnabled","physics:approximation"}
+    for prim in stage.Traverse():
+        if prim.HasAPI(UsdPhysics.CollisionAPI) and UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Get() is not False:
+            path=str(prim.GetPath())
+            entries.append(((source_paths or {}).get(path,path),prim.GetTypeName(),
+                str(cache.GetLocalToWorldTransform(prim)),
+                tuple((a.GetName(),str(a.Get())) for a in prim.GetAttributes()
+                    if a.GetName() in geometry_attributes)))
+    payload=json.dumps(sorted(entries),sort_keys=True).encode()
+    return {"collider_count":len(entries),"geometry_and_transform_sha256":hashlib.sha256(payload).hexdigest()}
+
+
+def _separate_geometry_roles(stage):
+    """Bridge USD CollisionAPI semantics to Genesis 1.4.2's name-pattern parser.
+
+    Preserve original prim paths as transform/body nodes. Each visual retains its
+    material subsets; each collider has its complete authored topology, without
+    visual subsets splitting one convex hull into many unrelated hulls.
+    """
+    from pxr import Sdf, UsdGeom, UsdPhysics
+    originals=[]
+    for prim in stage.Traverse():
+        if prim.IsA(UsdGeom.Gprim):
+            imageable=UsdGeom.Imageable(prim)
+            originals.append((str(prim.GetPath()),prim.GetTypeName(),
+                str(imageable.ComputeVisibility()),str(imageable.ComputePurpose()),
+                prim.HasAPI(UsdPhysics.CollisionAPI) and
+                UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Get() is not False))
+    # Collision visibility is independent of rendering visibility in USD. All
+    # source visibility is retained on explicit visual children below.
+    for prim in stage.Traverse():
+        if prim.IsA(UsdGeom.Imageable):
+            UsdGeom.Imageable(prim).CreateVisibilityAttr("inherited")
+    collision_sources={}
+    for path,type_name,visibility,purpose,collision in originals:
+        prim=stage.GetPrimAtPath(path)
+        for role in (("visual","collision") if collision else ("visual",)):
+            destination=path+"/__unirobosim_"+role
+            if stage.GetPrimAtPath(destination):
+                raise ValidationError("reserved derived geometry path already exists",operation="genesis.usd.roles")
+            Sdf.CopySpec(stage.GetRootLayer(),path,stage.GetRootLayer(),destination)
+            child=stage.GetPrimAtPath(destination)
+            for descendant in list(child.GetChildren()):
+                if role=="collision" or not descendant.IsA(UsdGeom.Subset):
+                    stage.RemovePrim(descendant.GetPath())
+            for attr in list(child.GetAttributes()):
+                if attr.GetName()=="xformOpOrder" or attr.GetName().startswith("xformOp:"):
+                    child.RemoveProperty(attr.GetName())
+            child.RemoveAPI(UsdPhysics.RigidBodyAPI)
+            child.RemoveAPI(UsdPhysics.ArticulationRootAPI)
+            child.RemoveAPI(UsdPhysics.MassAPI)
+            imageable=UsdGeom.Imageable(child)
+            imageable.CreateVisibilityAttr(visibility if role=="visual" else "inherited")
+            imageable.CreatePurposeAttr(purpose if role=="visual" else "guide")
+            if role=="visual":
+                child.RemoveAPI(UsdPhysics.CollisionAPI)
+                child.RemoveAPI(UsdPhysics.MeshCollisionAPI)
+            else:
+                collision_sources[destination]=path
+        prim.SetTypeName("Xform")
+        prim.RemoveAPI(UsdPhysics.CollisionAPI)
+        prim.RemoveAPI(UsdPhysics.MeshCollisionAPI)
+    return collision_sources
+
+
+def materialize_usd(entity, lease, derived_root):
+    from pxr import Usd, UsdGeom, UsdPhysics
+    source = Path(unquote(urlparse(entity.asset_uri).path)).resolve()
+    if lease is not None:
+        snapshot=lease.selected_path(entity_id=entity.metadata.to_dict().get("fastsim_entity_id",entity.path.value),
+            asset_uri=entity.asset_uri)
+        expected=lease.entry_for_path(snapshot).sha256
+        if hashlib.sha256(source.read_bytes()).hexdigest()!=expected:
+            raise ValidationError("USD root source changed after BuildInput snapshot",operation="genesis.usd")
+    allowed = next((parent for parent in source.parents if parent.name == "assets_lib"), source.parent)
+    stage = Usd.Stage.Open(str(source))
+    if stage is None:
+        raise ValidationError("cannot open USD stage", operation="genesis.usd", entity_path=entity.path.value)
+    # Asset references without stage metadata inherit the portable world's SI,
+    # Z-up composition context. OpenUSD's standalone cm/Y fallback is not an
+    # authored conversion request (notably for the production G2 resource).
+    source_unit=UsdGeom.GetStageMetersPerUnit(stage) if stage.HasAuthoredMetadata("metersPerUnit") else None
+    source_axis=str(UsdGeom.GetStageUpAxis(stage)) if stage.HasAuthoredMetadata("upAxis") else None
+    unit=1.0 if source_unit is None else source_unit
+    up_axis="Z" if source_axis is None else source_axis
+    layers = []
+    for layer in stage.GetUsedLayers():
+        if layer.anonymous:
+            continue
+        path = Path(layer.realPath).resolve()
+        if not path.is_relative_to(allowed):
+            raise ValidationError("USD layer escapes prepared asset tree", operation="genesis.usd",
+                details={"source": str(source), "layer": str(path), "allowed_root": str(allowed)})
+        raw = path.read_bytes()
+        layers.append({"path": str(path), "size": len(raw), "sha256": hashlib.sha256(raw).hexdigest()})
+    # Stage flatten resolves sublayers, references and payloads using their original
+    # resolver context; it does not triangulate or change mesh/physics authoring.
+    static = entity.kind is EntityKind.STATIC_SCENE or (
+        entity.kind is EntityKind.COMPOSITE_SCENE and
+        entity.metadata.to_dict().get("composite_unbound_rigid_mode") == "static")
+    destination = derived_root / (hashlib.sha256((str(source)+str(static)).encode()).hexdigest()[:20]+".usdc")
+    static_authoring = {"rigid_bodies": [], "disabled_joints": []}
+    closures=[];world_anchors=[]
+    collision_signature = _collision_signature(stage)
+    if not destination.exists():
+        stage.Flatten().Export(str(destination))
+        derived = Usd.Stage.Open(str(destination))
+        UsdGeom.SetStageMetersPerUnit(derived,unit)
+        UsdGeom.SetStageUpAxis(derived,up_axis)
+        if static:
+            # The portable static intent removes private dynamics while retaining
+            # every authored transform, collider and visual. Genesis 1.4.2 does
+            # not inspect physics:jointEnabled during graph discovery, so make
+            # disabled joints untyped in this derived stage as well. Their
+            # authored properties and paths are retained for provenance.
+            for prim in derived.Traverse():
+                if prim.HasAPI(UsdPhysics.RigidBodyAPI):
+                    static_authoring["rigid_bodies"].append(str(prim.GetPath()))
+                    prim.RemoveAPI(UsdPhysics.RigidBodyAPI)
+                if prim.IsA(UsdPhysics.Joint):
+                    static_authoring["disabled_joints"].append({
+                        "path":str(prim.GetPath()),"source_type":prim.GetTypeName()})
+                    UsdPhysics.Joint(prim).CreateJointEnabledAttr(False)
+                    prim.SetTypeName("")
+            if _collision_signature(derived) != collision_signature:
+                raise ValidationError("static intent changed collider geometry or transforms",operation="genesis.usd.static")
+        else:
+            closures,world_anchors=_normalize_joints(derived,entity.scale_xyz[0])
+        collision_sources=_separate_geometry_roles(derived)
+        if _collision_signature(derived,collision_sources) != collision_signature:
+            raise ValidationError("geometry role conversion changed colliders or transforms",operation="genesis.usd.roles")
+        derived.GetRootLayer().Save()
+    provenance={"source":str(source),"flattened":str(destination),"used_layers":layers,
+        "flattened_sha256":hashlib.sha256(destination.read_bytes()).hexdigest(),
+        "meters_per_unit":unit,"up_axis":up_axis,
+        "source_authored_meters_per_unit":source_unit,"source_authored_up_axis":source_axis}
+    if static:
+        provenance["declared_static_intent"] = static_authoring
+    provenance["collision_inventory"] = collision_signature
+    provenance["geometry_roles"] = "explicit-whole-collider-and-material-preserving-visual-v1"
+    provenance["connect_constraints"]=closures
+    provenance["normalized_world_anchors"]=world_anchors
+    (derived_root / (destination.stem+".provenance.json")).write_text(json.dumps(provenance,indent=2)+"\n")
+    # Link and native-named frame transforms remain authored USD values. Named
+    # frames have no physics body; evaluate their fixed offset from their owner.
+    by_name={}
+    for prim in stage.Traverse():
+        if prim.IsA(UsdGeom.Xformable):
+            by_name.setdefault(prim.GetName(),[]).append(prim)
+    cache=UsdGeom.XformCache()
+    named={}
+    declarations=entity.metadata.to_dict().get("planning_frame_declarations",{}).get("entries",[])
+    for declaration in declarations:
+        source_info=declaration["source"]
+        if source_info["kind"] == "link":
+            continue
+        owner_name=declaration["owner_link"]
+        frame_name=source_info["name"]
+        owners=by_name.get(owner_name,[]); frames=by_name.get(frame_name,[])
+        if len(owners)!=1 or len(frames)!=1:
+            raise ValidationError("named USD frame is missing or ambiguous",operation="genesis.usd.frames",
+                details={"name":frame_name,"owner":owner_name})
+        relative=cache.GetLocalToWorldTransform(frames[0])*cache.GetLocalToWorldTransform(owners[0]).GetInverse()
+        offset=_pose(relative)
+        offset=Pose(tuple(float(v*unit*entity.scale_xyz[i]) for i,v in enumerate(offset.position)),offset.orientation_xyzw)
+        named[declaration["name"]]=(owner_name,offset)
+    return destination,named,provenance

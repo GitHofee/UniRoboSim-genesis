@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unirobosim-genesis"
+version = "0.1.0"
+description = "Native Genesis World dynamics adapter for UniRoboSim"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = ["unirobosim>=0.10.9,<0.11", "numpy>=1.26,<3"]
+
+[project.optional-dependencies]
+engine = ["genesis-world[usd]==1.4.2", "trimesh==4.12.2"]
+dev = ["pytest>=8,<10"]
+
+[project.entry-points."unirobosim.backends"]
+genesis = "unirobosim_genesis:create_provider"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-config --strict-markers -ra"
+testpaths = ["tests"]
+markers = ["engine: uses the real Genesis runtime", "gpu: requires CUDA"]

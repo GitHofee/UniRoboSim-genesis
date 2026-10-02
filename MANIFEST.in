@@ -1,0 +1,3 @@
+include README.md RELEASE_NOTES.md
+recursive-include docs *.md *.txt
+recursive-include tests *.py *.json
