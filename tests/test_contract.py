@@ -15,7 +15,8 @@ def test_import_does_not_import_genesis_or_torch():
 def test_launch_profiles_and_capabilities():
     provider=create_provider(launch_profile='headless-physics')
     assert provider.descriptor.provider_id=='genesis-world.genesis'
-    assert provider.descriptor.version=='0.1.0'
+    from unirobosim_genesis import __version__
+    assert provider.descriptor.version==__version__
     assert provider.descriptor.contract_version=='v0alpha6'
     assert provider.descriptor.capabilities.get(CapabilityId('sensor.camera@1')) is None
     assert provider.descriptor.capabilities.get(CapabilityId('state.kinematics.selected@1')) is not None

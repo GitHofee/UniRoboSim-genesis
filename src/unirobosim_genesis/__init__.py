@@ -2,7 +2,7 @@
 from .config import GenesisAdapterConfig
 from .provider import GenesisProvider
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 def create_provider(config: GenesisAdapterConfig | None = None, *, launch_profile: str = "headless") -> GenesisProvider:
     if launch_profile not in {"visible", "headless", "headless-physics"}:

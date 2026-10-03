@@ -6,24 +6,26 @@ from unirobosim import (
 from .config import ENGINE_VERSION
 
 _BASIC = (
+    "state.fluid.particles@1", "state.deformable.volume@1", "deformable.topology.read@1",
     "state.rigid_body@1", "control.rigid_body.wrench@1", "contact.binary@1",
     "contact.net_normal_force@1", "state.articulation@1", "state.articulation.axis-units@1",
     "control.articulation.position@1", "control.articulation.position.axis-units@1",
     "control.articulation.velocity@1", "control.articulation.effort@1",
     "state.kinematics.selected@1", "world.multi-environment@1", "scene.snapshot@1",
     "scene.delta@1", "scene.command.pose@1", "scene.command.attachment@1",
-    "scene.composite@1", "scene.composite.unbound-rigid-mode@1", "render.state.apply@1",
+    "scene.static@1", "scene.composite@1", "scene.composite.unbound-rigid-mode@1", "render.state.apply@1",
 )
 
 def descriptor_for_config(config):
     declarations = [CapabilityDeclaration(CapabilityId(name)) for name in _BASIC]
+    declarations.append(CapabilityDeclaration(CapabilityId("control.fluid.particles@1"), FrozenMap({"modes":["position","velocity"]})))
     declarations.extend((
         CapabilityDeclaration(CapabilityId("profile.core-robotics@1"), FrozenMap({
             "coordinate_system": "right-handed-z-up", "quaternion_order": "xyzw", "array_layout": "batch-first"})),
         CapabilityDeclaration(CapabilityId("asset.formats@1"), FrozenMap({
             "rigid_body": ["model/vnd.usd", "model/vnd.usda", "model/vnd.usdc", "model/vnd.urdf+xml"],
             "articulation": ["model/vnd.usd", "model/vnd.usda", "model/vnd.usdc", "model/vnd.urdf+xml", "model/vnd.mujoco.mjcf+xml"],
-            "static_scene": ["model/vnd.usd", "model/vnd.usda", "model/vnd.usdc"]})),
+            "static_scene": ["model/vnd.usd", "model/vnd.usda", "model/vnd.usdc", "model/vnd.urdf+xml"]})),
         CapabilityDeclaration(CapabilityId("planning.scene@2"), FrozenMap({
             "authority_thread": "synchronous", "axis_convention": "right_handed_z_up",
             "geometry_read_limit_bytes": 64 * 1024 * 1024, "resource_layout": "catalog-pinned-v1",
@@ -43,13 +45,17 @@ def descriptor_for_config(config):
         })) for name in (
             "sensor.camera@1", "sensor.camera.rgb@1", "sensor.camera.depth@1",
             "sensor.camera.calibrated@1", "sensor.camera.render-exclusions@1"))
-    return ProviderDescriptor("genesis-world.genesis", "UniRoboSim Genesis", "0.1.0", "v0alpha6",
+    return ProviderDescriptor("genesis-world.genesis", "UniRoboSim Genesis", "0.1.1", "v0alpha6",
         CapabilitySet(tuple(declarations)),
         (WORLD_SCHEMA_VERSION, PHYSICAL_WORLD_SCHEMA_VERSION, COMPOSITE_WORLD_SCHEMA_VERSION),
         FrozenMap({
             "genesis-world": ENGINE_VERSION,
             "engine_distribution": "unmodified-official",
             "dynamics": "native-genesis",
+            "particle_colors": "static-linear-rgba",
+            "max_particle_color_palette": config.max_fluid_color_groups,
+            "surface_color_input": "canonical linear RGB encoded to native sRGB",
+            "output_color_transfer": "official rasterizer fixed gamma 2.2",
             "usd_loading": "native-usd-with-explicit-hash-pinned-asset-profile",
             "usd_acceleration_drives": "articulated_mass_normalized_pd",
             "acceleration_gain_update": "outer_control_tick",

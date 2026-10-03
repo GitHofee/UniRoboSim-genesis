@@ -77,6 +77,8 @@ class RenderStateMixin:
         self._ensure("genesis.render_state")
         if not isinstance(frame, RenderStateFrame):
             raise ValidationError("expected RenderStateFrame", operation="genesis.render_state")
+        if getattr(frame, "deformables", ()):
+            self._unsupported("deformable render state is not implemented", "genesis.render_state")
         if frame.particle_fluids:
             self._unsupported("particle render state is not implemented", "genesis.render_state")
         articulation_plans, root_plans, affected = [], [], {}

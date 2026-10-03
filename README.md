@@ -1,6 +1,6 @@
 # UniRoboSim Genesis adapter
 
-Provider `genesis-world.genesis` 0.1.0 implements UniRoboSim 0.10.9 contract
+Provider `genesis-world.genesis` 0.1.1 implements UniRoboSim 0.10.10 contract
 v0alpha6 using **unmodified official genesis-world==1.4.2**. Import is optional
 dependency safe. Install `unirobosim-genesis[engine]`; trimesh is pinned to 4.12.2.
 Experimental Genesis forks and the former USD-to-MJCF route are not supported.
@@ -154,3 +154,35 @@ headless Linux host set `PYOPENGL_PLATFORM=egl` in the process environment befor
 OpenGL is imported. No system graphics library or Genesis package patch is used.
 Original three-camera replay acceptance, including original visual surfaces,
 source-frame correspondence and saved images, remains a separate full-run gate.
+
+### Fluid and deformable recording
+
+The adapter supports fixed-count SPH fluids and volumetric FEM soft bodies using the official Genesis runtime. Fluid point state preserves authored particle ordering. `read_deformable_topology(handle)` returns the **native** mesh that corresponds to `read_deformable(handle)`; a recorder must use that mesh because Genesis tetrahedralizes the supplied surface and may add nodes.
+
+FEM remeshing is rejected by default. To explicitly permit it while preserving the authored total mass, construct the provider with:
+
+```python
+GenesisAdapterConfig(
+    fem_mass_policy="preserve_total_mass",
+    fem_young_modulus_pa=10000.0,
+    fem_poisson_ratio=0.2,
+)
+```
+
+The mass policy converts `authored node_count * node_mass_kg` to a uniform density over the authored volume. It preserves total mass, **not each remeshed node's mass**. The generated native volume must agree with the original volume. FEM pinned nodes, self collision, nonzero linear damping, nonuniform initial velocity and named materials currently reject explicitly. Surface cloth is not supported by this adapter profile. Genesis render-state replay for soft bodies also rejects explicitly; cross-backend playback requires a backend implementing deformable render state.
+
+SPH uses one particle radius per world. If explicitly provided, particle mass must match Genesis's `density * 0.8 * diameter**3`; incompatible mass rejects. Position and velocity particle commands are supported, force commands are not. Camera capture of mixed soft scenes uses the native camera path; the separate calibrated/USD visual proxy does not render soft bodies.
+
+### Appearance recording
+
+`world.capture_appearance()` captures the built official rasterizer's effective
+material parameters, stable URDF visual bindings, directional lighting,
+ambient/background and output transfer. Base-color PNG textures include embedded-resource
+candidates, UV coordinates and a visual-topology checksum. Record must consume the
+texture URI before closing the world. Repeated captures reuse content-addressed PNGs.
+
+The native vertex-color shader's effective roughness/metallic values are recorded,
+including differences from requested surface settings. Unsupported material graphs,
+nonuniform mesh vertex colors and ambiguous multi-submesh URDF bindings fail explicitly.
+Genesis currently rejects `apply_appearance`; the supported cross-engine workflow is
+Genesis capture followed by an appearance-capable replay backend such as Isaac Lab.

@@ -1,4 +1,4 @@
-"""UniRoboSim values backed exclusively by real Genesis rigid dynamics."""
+"""UniRoboSim values backed by official Genesis rigid, FEM and SPH dynamics."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -21,6 +21,8 @@ from unirobosim import (
 from .math import array, numpy, wxyz, xyzw, rotation, compose, inverse
 from .planning import PlanningMixin
 from .render_state import RenderStateMixin
+from .soft import SoftMixin
+from .appearance import AppearanceMixin
 
 
 @dataclass
@@ -34,7 +36,7 @@ class Attachment:
     parent_T_child: Pose
 
 
-class GenesisWorld(RenderStateMixin, PlanningMixin):
+class GenesisWorld(AppearanceMixin, SoftMixin, RenderStateMixin, PlanningMixin):
     def __init__(self, session, spec, generation, asset_lease=None):
         self._session, self._spec, self._generation = session, spec, generation
         self._asset_lease = asset_lease
@@ -44,6 +46,8 @@ class GenesisWorld(RenderStateMixin, PlanningMixin):
         self._reset_count = 0
         self._entities = {entity.path: entity for entity in spec.entities}
         self._bodies = {}
+        self._soft_entities = {}
+        self._fluid_colors = {}
         self._dofs = {}
         self._q_indices = {}
         self._position_references = {}
@@ -133,10 +137,16 @@ class GenesisWorld(RenderStateMixin, PlanningMixin):
         self._physics_provenance={"articulation_self_collision_policies":policies,
             "enable_self_collision":policies[0]["value"] if policies else True,"enable_neutral_collision":True,
             "seed":{"original_uint32":seed,"native_seed":getattr(gs,"SEED",None),"mapping":"uint32-low31-v1","host_seed":seed}}
+        from .particle_colors import linear_to_srgb
         self._scene = gs.Scene(
             sim_options=gs.options.SimOptions(dt=self._spec.physics.time_step_seconds,
                 substeps=self._spec.physics.substeps, gravity=self._spec.physics.gravity_m_s2),
             show_viewer=not config.headless,
+            vis_options=gs.options.VisOptions(background_color=tuple(v**(1/2.2) for v in config.background_color_linear),
+                ambient_light=config.ambient_light_linear,shadow=config.shadows,
+                lights=[dict(type="directional",dir=config.directional_light_direction,
+                    color=config.directional_light_color_linear,intensity=config.directional_light_intensity)]),
+            **self._soft_options(),
             rigid_options=gs.options.RigidOptions(enable_self_collision=self._physics_provenance["enable_self_collision"],
                 enable_neutral_collision=True,batch_dofs_info=True,
                 max_dynamic_constraints=8+sum(len(m.get("closures",())) for m in self._usd_robots.values())),
@@ -158,6 +168,7 @@ class GenesisWorld(RenderStateMixin, PlanningMixin):
             entity.metadata.to_dict().get("composite_unbound_rigid_mode")=="static")
 
     def _build_native(self):
+        from .particle_colors import linear_to_srgb
         gs = self._gs
         # Static materials may reduce grids only after every potentially moving
         # collision geometry has been inspected through the native public API.
@@ -165,6 +176,12 @@ class GenesisWorld(RenderStateMixin, PlanningMixin):
         for entity in ordered:
             if entity.kind is EntityKind.CAMERA_SENSOR:
                 self._add_camera(entity)
+                continue
+            if entity.kind is EntityKind.PARTICLE_FLUID:
+                self._add_fluid(entity)
+                continue
+            if entity.kind in {EntityKind.SURFACE_DEFORMABLE,EntityKind.VOLUME_DEFORMABLE}:
+                self._add_deformable(entity)
                 continue
             if entity.contact_compliance is not None:
                 self._unsupported("explicit contact compliance is not implemented", "genesis.build")
@@ -183,7 +200,7 @@ class GenesisWorld(RenderStateMixin, PlanningMixin):
                 volume = float(np.prod(np.asarray(box.dimensions_m)*entity.scale_xyz))
                 native = self._scene.add_entity(morph,
                     material=gs.materials.Rigid(rho=box.mass_kg/volume, friction=box.dynamic_friction),
-                    surface=gs.surfaces.Default(color=box.color_rgba))
+                    surface=gs.surfaces.Default(color=linear_to_srgb(box.color_rgba),roughness=self._session.config.material_roughness,metallic=0.0))
                 bodies = [native]
             elif entity.asset_uri is not None:
                 path = self._local_path(entity)
@@ -206,7 +223,7 @@ class GenesisWorld(RenderStateMixin, PlanningMixin):
                         for joint in ET.parse(path).getroot().findall("joint") if joint.attrib.get("type")=="fixed"}
                     morph=gs.morphs.URDF(merge_fixed_links=False,
                         fixed=bool(entity.metadata.to_dict().get("fixed_base",True)), **kwargs)
-                    bodies=[self._scene.add_entity(morph)]
+                    bodies=[self._scene.add_entity(morph,surface=gs.surfaces.Default(roughness=self._session.config.material_roughness,metallic=0.0))]
                 elif path.suffix.lower() in {".xml",".mjcf"}:
                     bodies=[self._scene.add_entity(gs.morphs.MJCF(**kwargs))]
                 else:
@@ -251,6 +268,7 @@ class GenesisWorld(RenderStateMixin, PlanningMixin):
             if entity.kind is EntityKind.ARTICULATION:
                 self._initialize_articulation(entity)
         if self._usd_robots:self._initialize_usd_mass_queries()
+        self._initialize_soft()
         self._initial_state=self._scene.get_state()
         self._initial_mass_matrices={p:m.copy() for p,m in self._mass_matrices.items()}
         self._init_root_offsets={}
@@ -779,6 +797,8 @@ class GenesisWorld(RenderStateMixin, PlanningMixin):
         if any(m not in {CameraModality.RGB,CameraModality.DEPTH} for m in camera.modalities):
             self._unsupported("camera modality is not implemented", "genesis.camera")
         if camera.calibration is not None or camera.render_exclusions or self._usd_materialized:
+            if any(e.kind in {EntityKind.PARTICLE_FLUID,EntityKind.SURFACE_DEFORMABLE,EntityKind.VOLUME_DEFORMABLE} for e in self._spec.entities):
+                self._unsupported("calibrated/USD visual proxy cannot render soft matter; use native camera", "genesis.camera")
             self._cameras[entity.path]=None
             return
         fov=math.degrees(2*math.atan(math.tan(math.radians(camera.horizontal_fov_degrees)/2)*camera.height_px/camera.width_px))
@@ -820,9 +840,6 @@ class GenesisWorld(RenderStateMixin, PlanningMixin):
     def publish_debug(self,*args,**kwargs): self._unsupported("native debug overlay is not implemented","genesis.debug")
     def clear_debug(self,*args,**kwargs): return 0
     def apply_deformable_command(self,*args,**kwargs): self._unsupported("deformable API is not implemented","genesis.deformable")
-    def read_deformable(self,*args,**kwargs): self._unsupported("deformable API is not implemented","genesis.deformable")
-    def apply_particle_fluid_command(self,*args,**kwargs): self._unsupported("particle API is not implemented","genesis.fluid")
-    def read_particle_fluid(self,*args,**kwargs): self._unsupported("particle API is not implemented","genesis.fluid")
 
     def close(self):
         if self._state is WorldState.CLOSED: return
